@@ -1,0 +1,14 @@
+{
+  "client_id": "d3590ed6-52b3-4102-aeff-aad2292ab01c",
+  "auth": "device",
+  "timezone": "Romance Standard Time",
+  "days_ahead": 60,
+  "block_subject": "Busy",
+  "mirror_show_as": ["busy", "oof", "tentative"],
+  "accounts": [
+    {"name": "org1", "email": "you@org1.com"},
+    {"name": "org2", "email": "you@org2.com"},
+    {"name": "org3", "email": "you@org3.com"},
+    {"name": "personal", "email": "you@outlook.com", "receive_blocks": false}
+  ]
+}

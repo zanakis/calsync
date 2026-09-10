@@ -1,0 +1,22 @@
+# Secrets and personal config — never commit
+config.json
+config.own.json
+tokens.json
+*.log
+
+# Python
+__pycache__/
+*.pyc
+
+# Android / Gradle build output
+android/build/
+android/app/build/
+android/.gradle/
+android/.kotlin/
+.gradle/
+android/local.properties
+
+# IDE / macOS
+.idea/
+*.iml
+.DS_Store
