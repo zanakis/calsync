@@ -15,7 +15,9 @@ class PlanTest {
         allDay: Boolean = false,
         cancelled: Boolean = false,
         tag: String? = null,
-    ) = Event("e${nextId++}", tag, start, end, showAs, allDay, cancelled)
+        uid: String? = null,
+        subject: String? = null,
+    ) = Event("e${nextId++}", tag, start, end, showAs, allDay, cancelled, uid, subject)
 
     private fun apply(cals: Map<String, MutableList<Event>>, plans: Map<String, Plan>) {
         for ((oid, p) in plans) {
@@ -78,6 +80,56 @@ class PlanTest {
         assertTrue(blocks(cals.getValue("P")).isEmpty())
         assertEquals(listOf("P"), blocks(cals.getValue("A")).map { it.tag })
         assertTrue(plan(cals, mirror, sendOnly = setOf("P")).values.all { it.create.isEmpty() && it.delete.isEmpty() })
+    }
+
+    @Test
+    fun sameMeetingInSeveralAccountsIsMirroredOnce() {
+        val cals = mapOf(
+            "A" to mutableListOf(ev("2026-09-10T10:00:00", "2026-09-10T11:00:00", "tentative", uid = "m1", subject = "Review")),
+            "B" to mutableListOf(ev("2026-09-10T10:00:00", "2026-09-10T11:00:00", "busy", uid = "m1", subject = "Review")),
+            "C" to mutableListOf<Event>(),
+        )
+        apply(cals, plan(cals, mirror))
+        assertTrue(blocks(cals.getValue("A")).isEmpty())
+        assertTrue(blocks(cals.getValue("B")).isEmpty())
+        assertEquals(listOf("B" to "busy"), blocks(cals.getValue("C")).map { it.tag to it.showAs })
+        assertTrue(plan(cals, mirror).values.all { it.create.isEmpty() && it.delete.isEmpty() })
+    }
+
+    @Test
+    fun matchesSameMeetingBySubjectWhenIdsDiffer() {
+        val cals = mapOf(
+            "A" to mutableListOf(ev("2026-09-10T09:00:00", "2026-09-10T09:15:00", uid = "x", subject = "Standup")),
+            "B" to mutableListOf(
+                ev("2026-09-10T09:00:00", "2026-09-10T09:15:00", uid = "y", subject = "Standup"),
+                ev("2026-09-10T09:00:00", "2026-09-10T09:15:00", uid = "z", subject = "Other"),
+            ),
+            "C" to mutableListOf<Event>(),
+        )
+        apply(cals, plan(cals, mirror))
+        assertEquals(listOf("B"), blocks(cals.getValue("A")).map { it.tag })
+        assertTrue(blocks(cals.getValue("B")).isEmpty())
+        assertEquals(listOf("A", "B"), blocks(cals.getValue("C")).mapNotNull { it.tag }.sorted())
+    }
+
+    @Test
+    fun removesBlocksLeftByEarlierDuplication() {
+        val cals = mapOf(
+            "A" to mutableListOf(
+                ev("2026-09-10T10:00:00", "2026-09-10T11:00:00", "tentative", uid = "m1"),
+                ev("2026-09-10T10:00:00", "2026-09-10T11:00:00", "tentative", tag = "B"),
+            ),
+            "B" to mutableListOf(
+                ev("2026-09-10T10:00:00", "2026-09-10T11:00:00", "tentative", uid = "m1"),
+                ev("2026-09-10T10:00:00", "2026-09-10T11:00:00", "tentative", tag = "A"),
+            ),
+            "C" to MutableList(4) { ev("2026-09-10T10:00:00", "2026-09-10T11:00:00", "tentative", tag = if (it < 2) "A" else "B") },
+        )
+        val p = plan(cals, mirror)
+        assertEquals(listOf(1, 1, 3), listOf("A", "B", "C").map { p.getValue(it).delete.size })
+        assertTrue(p.values.all { it.create.isEmpty() })
+        apply(cals, p)
+        assertEquals(listOf("A"), blocks(cals.getValue("C")).map { it.tag })
     }
 
     @Test

@@ -5,6 +5,7 @@ Copies busy time between your Microsoft 365 calendars. Each calendar gets privat
 - Only the start, end and status are copied. Subject, attendees, location and body are not.
 - Blocks are private, have no reminder and no attendees, so nobody gets an invite.
 - Events marked busy, away (out of office) or tentative are copied. Free and "working elsewhere" are not.
+- A meeting that's in more than one of your calendars (say, one invite sent to two of your addresses) counts once. It's matched by time plus the same meeting ID or subject. Calendars that already have it get no block, and each of the others gets a single one.
 - The window is from yesterday to `days_ahead` days ahead.
 - The tool only ever edits or deletes blocks it created. It tags them with a hidden property (the source account's Microsoft ID), and events you create yourself are never touched.
 - There is no local state. Everything is worked out from the calendars on each run, so the Mac and the Android app can both sync without getting in each other's way. A duplicate block can briefly appear and the next run removes it.

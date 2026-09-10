@@ -14,6 +14,8 @@ data class Event(
     val showAs: String,
     val isAllDay: Boolean,
     val isCancelled: Boolean,
+    val iCalUId: String? = null,
+    val subject: String? = null,
 ) {
     fun key(source: String) =
         BlockKey(source, start, end, showAs, isAllDay && start.endsWith("T00:00:00") && end.endsWith("T00:00:00"))
@@ -23,13 +25,37 @@ data class BlockKey(val source: String, val start: String, val end: String, val 
 
 class Plan(val create: List<BlockKey>, val delete: List<String>)
 
-fun plan(calendars: Map<String, List<Event>>, mirror: Set<String>, sendOnly: Set<String> = emptySet()): Map<String, Plan> {
-    val busy = calendars.mapValues { (oid, events) ->
-        events.filter { it.tag == null && !it.isCancelled && it.showAs in mirror }.map { it.key(oid) }
+private val showAsStrength = listOf("oof", "busy", "tentative", "workingElsewhere", "free", "unknown")
+
+private fun strength(showAs: String) = showAsStrength.indexOf(showAs).let { if (it < 0) showAsStrength.size else it }
+
+/**
+ * Groups copies of one meeting found in several calendars: same time, and same iCalUId or subject.
+ * Returns the accounts holding each meeting and the single block every other account should get.
+ * Must pick the same block as merge_meetings in calsync.py, or the Mac and the phone undo each other's blocks.
+ */
+fun meetings(sources: Map<String, List<Event>>): List<Pair<Set<String>, BlockKey>> {
+    val bySlot = mutableMapOf<Triple<String, String, Boolean>, MutableList<Pair<Set<String>, List<BlockKey>>>>()
+    for ((oid, events) in sources) for (ev in events) {
+        val key = ev.key(oid)
+        val ids = setOfNotNull(ev.iCalUId?.let { "uid:$it" }, ev.subject?.let { "subject:$it" })
+        val groups = bySlot.getOrPut(Triple(key.start, key.end, key.allDay)) { mutableListOf() }
+        val hits = groups.filter { (it.first intersect ids).isNotEmpty() }
+        groups.removeAll(hits)
+        groups += (ids + hits.flatMap { it.first }) to (listOf(key) + hits.flatMap { it.second })
     }
+    return bySlot.values.flatten().map { (_, keys) ->
+        keys.map { it.source }.toSet() to keys.minWith(compareBy<BlockKey>({ strength(it.showAs) }, { it.source }))
+    }
+}
+
+fun plan(calendars: Map<String, List<Event>>, mirror: Set<String>, sendOnly: Set<String> = emptySet()): Map<String, Plan> {
+    val meetings = meetings(calendars.mapValues { (_, events) ->
+        events.filter { it.tag == null && !it.isCancelled && it.showAs in mirror }
+    })
     return calendars.mapValues { (target, events) ->
         val wanted = if (target in sendOnly) emptyMap<BlockKey, Int>()
-        else busy.filterKeys { it != target }.values.flatten().groupingBy { it }.eachCount()
+        else meetings.filter { target !in it.first }.groupingBy { it.second }.eachCount()
         // Blocks from accounts not read this run (failing, or only set up on another device) are left alone.
         val existing = events.filter { it.tag != null && it.tag in calendars }.groupBy({ it.key(it.tag!!) }, { it.id })
         Plan(

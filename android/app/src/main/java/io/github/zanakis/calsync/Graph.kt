@@ -8,6 +8,7 @@ import java.net.HttpURLConnection
 import java.net.URL
 
 const val BLOCK_TAG = "String {6f1c2a52-8e4b-4d8e-9a57-3c0f5b7d2e91} Name CalSyncSource"
+const val CREATION_TIME = "SystemTime 0x3007"
 
 class Response(val code: Int, val text: String, val retryAfter: String?)
 
@@ -69,8 +70,9 @@ class Graph(private val token: String) {
         val query = linkedMapOf(
             "startDateTime" to start,
             "endDateTime" to end,
-            "\$select" to "start,end,showAs,isAllDay,isCancelled",
-            "\$expand" to "singleValueExtendedProperties(\$filter=id eq '$BLOCK_TAG')",
+            // Graph silently drops the expanded properties unless $select includes organizer (or there is no $select).
+            "\$select" to "start,end,showAs,isAllDay,isCancelled,subject,iCalUId,organizer",
+            "\$expand" to "singleValueExtendedProperties(\$filter=id eq '$BLOCK_TAG' or id eq '$CREATION_TIME')",
             "\$top" to "250",
         )
         var next: String? = "/me/calendarView?" + query.entries.joinToString("&") { "${it.key}=${Uri.encode(it.value)}" }
@@ -84,15 +86,28 @@ class Graph(private val token: String) {
         return events
     }
 
-    private fun parse(o: JSONObject) = Event(
-        id = o.getString("id"),
-        tag = o.optJSONArray("singleValueExtendedProperties")?.optJSONObject(0)?.optString("value"),
-        start = o.getJSONObject("start").getString("dateTime").take(19),
-        end = o.getJSONObject("end").getString("dateTime").take(19),
-        showAs = o.optString("showAs"),
-        isAllDay = o.optBoolean("isAllDay"),
-        isCancelled = o.optBoolean("isCancelled"),
-    )
+    private fun parse(o: JSONObject): Event {
+        val props = o.optJSONArray("singleValueExtendedProperties")
+        // Every event has a creation time, so a missing one means the expansion was dropped and tags can't be trusted.
+        if (props == null || props.length() == 0) {
+            throw GraphException("Graph didn't return block tags, so this calendar was left alone")
+        }
+        val tag = (0 until props.length()).map { props.getJSONObject(it) }
+            .firstOrNull { it.optString("id").equals(BLOCK_TAG, ignoreCase = true) }?.optString("value")
+        return Event(
+            id = o.getString("id"),
+            tag = tag,
+            start = o.getJSONObject("start").getString("dateTime").take(19),
+            end = o.getJSONObject("end").getString("dateTime").take(19),
+            showAs = o.optString("showAs"),
+            isAllDay = o.optBoolean("isAllDay"),
+            isCancelled = o.optBoolean("isCancelled"),
+            iCalUId = o.text("iCalUId"),
+            subject = o.text("subject"),
+        )
+    }
+
+    private fun JSONObject.text(name: String) = if (isNull(name)) null else optString(name).ifEmpty { null }
 
     fun delete(id: String) {
         call("DELETE", "/me/events/${Uri.encode(id)}")

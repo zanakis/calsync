@@ -23,6 +23,8 @@ GRAPH = "https://graph.microsoft.com/v1.0"
 SCOPES = "https://graph.microsoft.com/Calendars.ReadWrite offline_access openid profile"
 TAG = "String {6f1c2a52-8e4b-4d8e-9a57-3c0f5b7d2e91} Name CalSyncSource"
 DEFAULT_SHOW_AS = ["busy", "oof", "tentative"]
+SHOW_AS_STRENGTH = ["oof", "busy", "tentative", "workingElsewhere", "free", "unknown"]
+CREATION_TIME = "SystemTime 0x3007"
 
 
 class SyncError(Exception):
@@ -283,8 +285,9 @@ def list_events(cfg, token, start, end):
     query = {
         "startDateTime": start.isoformat(timespec="seconds"),
         "endDateTime": end.isoformat(timespec="seconds"),
-        "$select": "start,end,showAs,isAllDay,isCancelled",
-        "$expand": f"singleValueExtendedProperties($filter=id eq '{TAG}')",
+        # Graph silently drops the expanded properties unless $select includes organizer (or there is no $select).
+        "$select": "start,end,showAs,isAllDay,isCancelled,subject,iCalUId,organizer",
+        "$expand": f"singleValueExtendedProperties($filter=id eq '{TAG}' or id eq '{CREATION_TIME}')",
         "$top": "250",
     }
     path = "/me/calendarView?" + "&".join(f"{k}={urllib.parse.quote(v, safe='')}" for k, v in query.items())
@@ -293,12 +296,17 @@ def list_events(cfg, token, start, end):
         page = graph(cfg, token, "GET", path)
         events += page["value"]
         path = page.get("@odata.nextLink")
+    # Every event has a creation time, so a missing one means the expansion was dropped and tags can't be trusted.
+    if any(not ev.get("singleValueExtendedProperties") for ev in events):
+        raise SyncError("Graph didn't return block tags, so this calendar was left alone")
     return events
 
 
 def tag_of(ev):
-    props = ev.get("singleValueExtendedProperties") or []
-    return props[0]["value"] if props else None
+    for prop in ev.get("singleValueExtendedProperties") or []:
+        if prop["id"].lower() == TAG.lower():
+            return prop["value"]
+    return None
 
 
 def tagged_blocks(cfg, token):
@@ -311,6 +319,31 @@ def block_key(ev):
     start, end = ev["start"]["dateTime"][:19], ev["end"]["dateTime"][:19]
     all_day = bool(ev.get("isAllDay")) and start.endswith("T00:00:00") and end.endswith("T00:00:00")
     return start, end, ev["showAs"], all_day
+
+
+def strength(show_as):
+    return SHOW_AS_STRENGTH.index(show_as) if show_as in SHOW_AS_STRENGTH else len(SHOW_AS_STRENGTH)
+
+
+def merge_meetings(sources):
+    """Group copies of one meeting found in several calendars: same time, and same iCalUId or subject.
+
+    Returns (accounts holding it, the single block key every other account should get) per meeting.
+    """
+    by_slot = defaultdict(list)
+    for oid, events in sources.items():
+        for ev in events:
+            key = (oid,) + block_key(ev)
+            ids = {(field, ev[field]) for field in ("iCalUId", "subject") if ev.get(field)}
+            groups = by_slot[key[1], key[2], key[4]]
+            keys = [key]
+            for hit in [g for g in groups if g[0] & ids]:
+                groups.remove(hit)
+                ids |= hit[0]
+                keys += hit[1]
+            groups.append((ids, keys))
+    return [({k[0] for k in keys}, min(keys, key=lambda k: (strength(k[3]), k[0])))
+            for groups in by_slot.values() for _, keys in groups]
 
 
 def delete_event(cfg, token, event_id):
@@ -346,16 +379,15 @@ def cmd_sync(cfg, tokens, args):
             ok = False
             log(f"{acct['name']}: {e}")
 
-    busy = {
-        oid: [block_key(ev) for ev in events
-              if tag_of(ev) is None and not ev.get("isCancelled") and ev.get("showAs") in mirror]
+    meetings = merge_meetings({
+        oid: [ev for ev in events if tag_of(ev) is None and not ev.get("isCancelled") and ev.get("showAs") in mirror]
         for oid, (_, _, events, _) in fetched.items()
-    }
+    })
 
     for target, (name, token, events, receives) in fetched.items():
         wanted = Counter()
         if receives:
-            wanted.update((src,) + key for src, keys in busy.items() if src != target for key in keys)
+            wanted.update(key for holders, key in meetings if target not in holders)
         existing = defaultdict(list)
         for ev in events:
             src = tag_of(ev)
