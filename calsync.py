@@ -10,6 +10,7 @@ import json
 import os
 import re
 import secrets
+import subprocess
 import sys
 import time
 import urllib.error
@@ -24,8 +25,14 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.environ.get("CALSYNC_CONFIG", os.path.join(HERE, "config.json"))
 TOKENS_PATH = os.environ.get("CALSYNC_TOKENS", os.path.join(HERE, "tokens.json"))
 OWA_BLOCKS_PATH = os.environ.get("CALSYNC_OWA_BLOCKS", os.path.join(HERE, "owa-blocks.json"))
+OWA_STATE_PATH = os.environ.get("CALSYNC_OWA_STATE", os.path.join(HERE, "owa-state.json"))
 VENV_PYTHON = os.path.join(HERE, ".venv", "bin", "python")
 OWA_BLOCK_RETENTION = 3 * 86400
+OWA_STALE_AFTER = 3 * 86400
+OWA_NEAR_DAYS = 14
+NOTIFIER = os.environ.get("CALSYNC_NOTIFIER", "/opt/homebrew/bin/terminal-notifier")
+NOTIFY_TIMEOUT = 4 * 3600
+SKIP_TODAY = "Skip today"
 GRAPH = "https://graph.microsoft.com/v1.0"
 SCOPES = "https://graph.microsoft.com/Calendars.ReadWrite offline_access openid profile"
 TAG = "String {6f1c2a52-8e4b-4d8e-9a57-3c0f5b7d2e91} Name CalSyncSource"
@@ -76,7 +83,7 @@ def load_config():
         if a.get("owa") and not a.get("ics_url"):
             sys.exit(f"Account {a['name']!r} uses Outlook on the web, which also needs its ics_url")
     if sum(1 for a in cfg["accounts"] if a.get("owa")) > 1:
-        sys.exit("Only one account can use Outlook on the web, since they share one browser")
+        sys.exit("Only one account can use Outlook on the web")
     return cfg
 
 
@@ -408,12 +415,152 @@ def owa_module():
 def open_calendar(cfg, acct, tokens, stack):
     """The writable calendar behind an account, or None for one that is only read from its ICS feed."""
     if is_owa(acct):
-        cal = owa_module().Calendar(cfg, acct, SyncError, TAG, CREATION_TIME)
+        cal = owa_module().Calendar(cfg, acct, SyncError, TAG, CREATION_TIME,
+                                    on_created=lambda uid: record_owa_blocks(acct, [uid]))
         stack.callback(cal.close)
         return cal
     if is_ics(acct):
         return None
     return GraphCalendar(cfg, acct, tokens)
+
+
+def reap_owa_orphans():
+    try:
+        import owa
+        killed = owa.reap_orphans()
+    except Exception as e:
+        log(f"couldn't check for a leftover Outlook on the web browser: {e}")
+        return
+    if killed:
+        log(f"killed {len(killed)} leftover Outlook on the web browser processes")
+
+
+def owa_state(acct):
+    return load_json(OWA_STATE_PATH, {}).get(acct["name"], {})
+
+
+def save_owa_state(acct, **changes):
+    known = load_json(OWA_STATE_PATH, {})
+    known.setdefault(acct["name"], {}).update(changes)
+    save_json(OWA_STATE_PATH, known)
+
+
+def wanted_blocks(meetings, target):
+    wanted = Counter()
+    wanted.update(key for holders, key in meetings if target not in holders)
+    return wanted
+
+
+def mirrored(events, mirror):
+    return [ev for ev in events if tag_of(ev) is None and not ev.get("isCancelled") and ev.get("showAs") in mirror]
+
+
+def owa_offline_view(cfg, tokens, acct, graph_events=None):
+    """The blocks the Outlook on the web account should hold, worked out without a session: Graph accounts plus its ICS feed.
+
+    Returns (block keys, sources that were read).
+    """
+    start, end = sync_window(cfg)
+    mirror = set(cfg.get("mirror_show_as", DEFAULT_SHOW_AS))
+    sources, graph_read = {}, 0
+    for other in cfg["accounts"]:
+        try:
+            if is_ics(other):
+                sources[source_id(tokens, other)] = read_ics(cfg, other, start, end)
+                continue
+            oid = source_id(tokens, other)
+            if graph_events is not None:
+                if oid not in graph_events:
+                    continue
+                events = graph_events[oid]
+            else:
+                events = GraphCalendar(cfg, other, tokens).list_events(start, end)
+            sources[oid] = events
+            graph_read += 1
+        except SyncError as e:
+            if other is acct:
+                raise
+            log(f"{other['name']}: {e}")
+    if not graph_read:
+        raise SyncError("no calendar to copy busy time from could be read")
+    target = source_id(tokens, acct)
+    meetings = merge_meetings({oid: mirrored(events, mirror) for oid, events in sources.items()})
+    keys = set(wanted_blocks(meetings, target)) if acct.get("receive_blocks", True) else set()
+    return keys, set(sources)
+
+
+def owa_pending(cfg, tokens, acct):
+    """Changes the Outlook on the web account has waiting since its last complete write, as (future changes, how many are near)."""
+    keys, read = owa_offline_view(cfg, tokens, acct)
+    baseline = {tuple(k) for k in owa_state(acct).get("baseline", []) if k[0] in read}
+    local = zone(cfg["timezone"])
+    now = datetime.now(local)
+    near = now + timedelta(days=OWA_NEAR_DAYS)
+    starts = {k: datetime.fromisoformat(k[1]).replace(tzinfo=local) for k in keys ^ baseline}
+    pending = [k for k, s in starts.items() if s > now]
+    return pending, sum(1 for k in pending if starts[k] < near)
+
+
+def when(ts):
+    if not ts:
+        return "never"
+    t, today = datetime.fromtimestamp(ts), date.today()
+    if t.date() == today:
+        return f"today at {t:%H:%M}"
+    if t.date() == today - timedelta(days=1):
+        return f"yesterday at {t:%H:%M}"
+    return f"{t:%a %d %b} at {t:%H:%M}"
+
+
+def plural(n, word):
+    return f"{n} {word}" + ("" if n == 1 else "s")
+
+
+def notify(message):
+    """Show a notification that doesn't take focus. Returns @ACTIONCLICKED for a click on it, SKIP_TODAY, or why it ended."""
+    try:
+        r = subprocess.run([NOTIFIER, "-title", "calsync", "-message", message, "-group", "calsync-ask",
+                            "-action", SKIP_TODAY, "-timeout", str(NOTIFY_TIMEOUT)],
+                           capture_output=True, text=True, timeout=NOTIFY_TIMEOUT + 60)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise SyncError(f"couldn't show the notification: {e}")
+    answer = r.stdout.strip()
+    if answer not in ("@ACTIONCLICKED", SKIP_TODAY):
+        subprocess.run([NOTIFIER, "-remove", "calsync-ask"], capture_output=True)
+    if not answer:
+        raise SyncError(f"couldn't show the notification: {(r.stderr.strip() or f'exit {r.returncode}').splitlines()[0][:200]}")
+    return answer
+
+
+def ask_to_sync(cfg, tokens, acct):
+    """For the scheduled run: whether the user clicked through to an Outlook on the web sync."""
+    state = owa_state(acct)
+    if state.get("skip_until", 0) > time.time():
+        return False
+    try:
+        pending, near = owa_pending(cfg, tokens, acct)
+    except SyncError as e:
+        log(f"{acct['name']}: {e}, so not asking to update it")
+        return False
+    fresh = state.get("complete") and time.time() - state.get("written_at", 0) < OWA_STALE_AFTER
+    if fresh and not near:
+        return False
+    log(f"{acct['name']}: asking to update ({plural(len(pending), 'change')} waiting, {near} in the next {OWA_NEAR_DAYS} days)")
+    try:
+        answer = notify(f"{acct['name']} busy blocks last updated {when(state.get('written_at'))}. "
+                        f"{plural(len(pending), 'change')} waiting, {near} in the next {OWA_NEAR_DAYS} days.")
+    except SyncError as e:
+        log(f"{acct['name']}: {e}")
+        return False
+    if answer == SKIP_TODAY:
+        tomorrow = datetime.combine(date.today() + timedelta(days=1), datetime.min.time())
+        save_owa_state(acct, skip_until=tomorrow.timestamp())
+        log(f"{acct['name']}: skipped for today")
+        return False
+    if answer != "@ACTIONCLICKED":
+        log(f"{acct['name']}: not updated ({answer.lstrip('@').lower()})")
+        return False
+    return True
 
 
 def owa_block_uids(acct):
@@ -704,11 +851,19 @@ def read_ics(cfg, acct, start, end):
 
 
 def cmd_sync(cfg, tokens, args):
+    if not args.owa:
+        reap_owa_orphans()
+    owa_acct = next((a for a in cfg["accounts"] if is_owa(a)), None)
+    if args.owa and owa_acct is None:
+        sys.exit("No account in config.json uses Outlook on the web")
+    if args.ask and not ask_to_sync(cfg, tokens, owa_acct):
+        return 0
     start, end = sync_window(cfg)
     mirror = set(cfg.get("mirror_show_as", DEFAULT_SHOW_AS))
 
     fetched, ok = {}, True
-    for acct in cfg["accounts"]:
+    # Outlook on the web goes first: everything else is read once the user has signed in, so the diff is fresh.
+    for acct in sorted(cfg["accounts"], key=lambda a: not (args.owa and is_owa(a))):
         try:
             writes = is_owa(acct) == bool(args.owa)
             if is_ics(acct) and not (writes and is_owa(acct)):
@@ -721,18 +876,15 @@ def cmd_sync(cfg, tokens, args):
         except SyncError as e:
             ok = False
             log(f"{acct['name']}: {e}")
+            if args.owa and is_owa(acct):
+                return 1
 
-    meetings = merge_meetings({
-        oid: [ev for ev in events if tag_of(ev) is None and not ev.get("isCancelled") and ev.get("showAs") in mirror]
-        for oid, (_, _, events, _) in fetched.items()
-    })
+    meetings = merge_meetings({oid: mirrored(events, mirror) for oid, (_, _, events, _) in fetched.items()})
 
     for target, (name, cal, events, receives) in fetched.items():
         if cal is None:
             continue
-        wanted = Counter()
-        if receives:
-            wanted.update(key for holders, key in meetings if target not in holders)
+        wanted = wanted_blocks(meetings, target) if receives else Counter()
         existing = defaultdict(list)
         for ev in events:
             src = tag_of(ev)
@@ -752,23 +904,30 @@ def cmd_sync(cfg, tokens, args):
         if args.dry_run:
             continue
 
-        try:
-            for _, event_id in stale:
+        acct = account(cfg, name)
+        if is_owa(acct):
+            record_owa_blocks(acct, [ev["iCalUId"] for ev in events if tag_of(ev) is not None])
+        for _, event_id in stale:
+            try:
+                cal.delete_event(event_id)
+            except SyncError as e:
+                ok = False
+                log(f"{name}: {e}")
+        for key in missing:
+            try:
+                cal.create_block(*key)
+            except SyncError as e:
+                ok = False
+                log(f"{name}: {e}")
+        if is_owa(acct):
+            save_owa_state(acct, written_at=time.time(), complete=ok)
+            if ok:
+                graph_events = {oid: evs for oid, (n, _, evs, _) in fetched.items() if not is_ics(account(cfg, n))}
                 try:
-                    cal.delete_event(event_id)
+                    baseline, _ = owa_offline_view(cfg, tokens, acct, graph_events)
+                    save_owa_state(acct, baseline=sorted(baseline))
                 except SyncError as e:
-                    ok = False
-                    log(f"{name}: {e}")
-            for key in missing:
-                try:
-                    cal.create_block(*key)
-                except SyncError as e:
-                    ok = False
-                    log(f"{name}: {e}")
-        finally:
-            acct = account(cfg, name)
-            if is_owa(acct):
-                record_owa_blocks(acct, [ev["iCalUId"] for ev in events if tag_of(ev) is not None] + cal.created)
+                    log(f"{name}: couldn't record what was written ({e})")
     return 0 if ok else 1
 
 
@@ -781,11 +940,8 @@ def wants_device(cfg, acct):
 def cmd_login(cfg, tokens, args):
     acct = account(cfg, args.name)
     if is_owa(acct):
-        try:
-            owa_module().login(acct, SyncError)
-        except SyncError as e:
-            sys.exit(f"{acct['name']}: {e}")
-        print(f"Signed in to {acct['name']} in Outlook on the web")
+        print(f"{acct['name']} keeps no sign-in. Run calsync.py sync --owa: it opens a browser window to sign in,"
+              " writes the blocks, then signs out and closes it.")
         return
     if is_ics(acct):
         sys.exit(f"{acct['name']} is read from its ICS feed and needs no sign-in")
@@ -811,9 +967,12 @@ def cmd_status(cfg, tokens, args):
                 print(f"{acct['name']}: ICS feed OK, {len(events) - own} events in the sync window"
                       + (f" plus {own} of calsync's blocks" if is_owa(acct) else " (read-only)"))
             if is_owa(acct):
-                cal = open_calendar(cfg, acct, tokens, args.stack)
-                blocks = [ev for ev in cal.list_events(start, end) if tag_of(ev) is not None]
-                print(f"{acct['name']}: Outlook on the web OK, {len(blocks)} blocks in the sync window")
+                state = owa_state(acct)
+                pending, near = owa_pending(cfg, tokens, acct)
+                print(f"{acct['name']}: blocks last written {when(state.get('written_at'))}"
+                      + ("" if state.get("complete", True) else " (with errors)")
+                      + f", {plural(len(pending), 'change')} waiting, {near} in the next {OWA_NEAR_DAYS} days"
+                      + (" (skipped for today)" if state.get("skip_until", 0) > time.time() else ""))
             elif not is_ics(acct):
                 cal = open_calendar(cfg, acct, tokens, args.stack)
                 graph(cfg, cal.token, "GET", "/me/calendar?$select=name")
@@ -876,11 +1035,9 @@ def cmd_remove(cfg, tokens, args):
 def uses_owa(cfg, args):
     if args.cmd == "sync":
         return args.owa
-    if args.cmd == "login":
-        return is_owa(account(cfg, args.name))
     if args.cmd == "clean" and args.names:
         return any(is_owa(account(cfg, n)) for n in args.names)
-    return args.cmd in ("status", "remove", "clean") and any(is_owa(a) for a in cfg["accounts"])
+    return args.cmd in ("remove", "clean") and any(is_owa(a) for a in cfg["accounts"])
 
 
 def use_venv_if_needed(cfg, args):
@@ -899,7 +1056,8 @@ def main():
     mode.add_argument("--device", action="store_true", help="sign in with a code at microsoft.com/devicelogin")
     p = sub.add_parser("sync", help="mirror busy blocks between all accounts (default)")
     p.add_argument("--dry-run", action="store_true", help="show changes without making them")
-    p.add_argument("--owa", action="store_true", help="write blocks into the Outlook on the web calendar instead")
+    p.add_argument("--owa", action="store_true", help="sign in to Outlook on the web and write blocks into that calendar instead")
+    p.add_argument("--ask", action="store_true", help="with --owa: first ask in a notification, if blocks are out of date")
     p.add_argument("-v", "--verbose", action="store_true")
     sub.add_parser("status", help="check that every account is signed in")
     p = sub.add_parser("remove", help="delete an account's blocks from every calendar and sign out of it")
@@ -909,6 +1067,8 @@ def main():
     p.add_argument("--dry-run", action="store_true")
 
     args = parser.parse_args(sys.argv[1:] or ["sync"])
+    if getattr(args, "ask", False) and not args.owa:
+        parser.error("--ask needs --owa")
     cfg = load_config()
     use_venv_if_needed(cfg, args)
     tokens = load_json(TOKENS_PATH, {})

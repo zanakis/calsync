@@ -1,29 +1,31 @@
-"""Outlook on the web transport for calsync: a calendar reached through a resident, signed-in Chromium."""
+"""Outlook on the web transport for calsync: a calendar reached through a browser the user signs in to for one run."""
 import fcntl
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 import urllib.parse
 from pathlib import Path
 
 ORIGIN = "https://outlook.cloud.microsoft"
 CALENDAR_URL = ORIGIN + "/calendar/view/week"
+SIGN_OUT_URLS = (ORIGIN + "/owa/logoff.owa", "https://login.microsoftonline.com/common/oauth2/v2.0/logout")
 HOME = Path(os.environ.get("CALSYNC_OWA_HOME", Path.home() / "Library/Application Support/calsync"))
-PROFILE = HOME / "owa-profile"
 LOCK = HOME / "owa.lock"
-BROWSER_JOB = "io.github.zanakis.calsync.browser"
+TMP = HOME / "owa-tmp"
+MARKER = "--calsync-owa"
 SESSION_HEADERS = ("authorization", "x-anchormailbox", "x-owa-sessionid", "x-client-version")
 LOGIN_HOSTS = ("login.microsoftonline.com", "login.microsoft.com", "login.live.com")
-CHROMIUM_FLAGS = [
-    "--remote-debugging-port=0",
+SIGN_IN_TIMEOUT = 300
+RUN_TIMEOUT = 600
+BROWSER_ARGS = [
+    MARKER,
     "--no-first-run",
     "--no-default-browser-check",
-    # The profile was created under Playwright, which encrypts cookies with this mock key instead of the login keychain.
-    "--use-mock-keychain",
-    "--password-store=basic",
     "--disable-sync",
     "--disable-search-engine-choice-screen",
     "--mute-audio",
@@ -39,61 +41,29 @@ FETCH = """async ([url, method, headers, body]) => {
 }"""
 
 
-def not_running(acct):
-    return f"browser not running (run: calsync.py login {acct['name']})" if acct else "browser not running"
-
-
-def needs_sign_in(acct):
-    return f"needs sign-in (run: calsync.py login {acct['name']})"
-
-
-def devtools_port():
-    try:
-        return int((PROFILE / "DevToolsActivePort").read_text().split()[0])
-    except (OSError, ValueError, IndexError):
-        return None
-
-
 def on_login_page(url):
     return (urllib.parse.urlsplit(url).hostname or "") in LOGIN_HOSTS
 
 
-class Browser:
-    """An attachment to the resident browser over CDP. Closing it detaches and leaves the browser running."""
+def leftover_pids():
+    # Browser helpers don't carry the marker switch, but every process of the browser has the temp profile in its arguments.
+    pids = set()
+    for pattern in (MARKER, str(TMP)):
+        out = subprocess.run(["pgrep", "-f", "--", pattern], capture_output=True, text=True).stdout
+        pids |= {int(p) for p in out.split()}
+    pids.discard(os.getpid())
+    return pids
 
-    def __init__(self, error, acct=None):
-        from playwright.sync_api import Error, sync_playwright
-        self.Error = Error
-        port = devtools_port()
-        if not port:
-            raise error(not_running(acct))
-        self.pw = sync_playwright().start()
+
+def kill_leftovers():
+    pids = leftover_pids()
+    for pid in pids:
         try:
-            self.browser = self.pw.chromium.connect_over_cdp(f"http://127.0.0.1:{port}", timeout=15000)
-            self.ctx = self.browser.contexts[0]
-            pages = [p for p in self.ctx.pages if not p.url.startswith("devtools://")]
-            self.page = pages[0] if pages else self.ctx.new_page()
-        except Error:
-            self.pw.stop()
-            raise error(not_running(acct))
-
-    def set_window(self, state):
-        cdp = self.ctx.new_cdp_session(self.page)
-        try:
-            window = cdp.send("Browser.getWindowForTarget")["windowId"]
-            cdp.send("Browser.setWindowBounds", {"windowId": window, "bounds": {"windowState": state}})
-        finally:
-            cdp.detach()
-
-    def window_state(self):
-        cdp = self.ctx.new_cdp_session(self.page)
-        try:
-            return cdp.send("Browser.getWindowForTarget")["bounds"]["windowState"]
-        finally:
-            cdp.detach()
-
-    def close(self):
-        self.pw.stop()
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    shutil.rmtree(TMP, ignore_errors=True)
+    return pids
 
 
 def take_lock(error):
@@ -103,42 +73,66 @@ def take_lock(error):
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
         os.close(fd)
-        raise error("another calsync run is using the browser")
+        raise error("another calsync run is using Outlook on the web")
     return fd
 
 
-class Calendar:
-    def __init__(self, cfg, acct, error, tag, creation_time):
-        self.cfg, self.acct, self.error = cfg, acct, error
-        self.tag, self.creation_time = tag, creation_time
-        self.headers = None
-        self.created = []
+def reap_orphans():
+    """Kill a session browser left behind by a run that died. Returns the killed PIDs, or None while a run holds the lock."""
+    try:
+        fd = take_lock(RuntimeError)
+    except RuntimeError:
+        return None
+    try:
+        return kill_leftovers() if leftover_pids() or TMP.exists() else set()
+    finally:
+        os.close(fd)
+
+
+class Session:
+    """One headed, off-the-record browser for one run. Nothing of it outlives close(): no profile, port or saved state."""
+
+    def __init__(self, error, acct):
+        self.error, self.acct = error, acct
         self.lock = take_lock(error)
+        self.pw = self.browser = self.ctx = None
+        self.signed_in = False
+        self.watchdog = threading.Timer(RUN_TIMEOUT, self.expire)
+        self.watchdog.daemon = True
         try:
-            self.browser = Browser(error, acct)
-        except BaseException:
-            os.close(self.lock)
+            self.watchdog.start()
+            signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
+            kill_leftovers()
+            TMP.mkdir(mode=0o700)
+            # Playwright's driver puts its temp profile and artifacts under TMPDIR, so they land in a folder calsync owns and wipes.
+            from playwright.sync_api import Error, sync_playwright
+            self.Error = Error
+            saved = os.environ.get("TMPDIR")
+            os.environ["TMPDIR"] = str(TMP)
+            try:
+                self.pw = sync_playwright().start()
+            finally:
+                if saved is None:
+                    del os.environ["TMPDIR"]
+                else:
+                    os.environ["TMPDIR"] = saved
+            self.browser = self.pw.chromium.launch(
+                channel="msedge", headless=False, args=BROWSER_ARGS,
+                ignore_default_args=["--enable-automation"])
+            self.ctx = self.browser.new_context(no_viewport=True)
+            self.page = self.ctx.new_page()
+        except BaseException as e:
+            self.close()
+            if isinstance(e, Exception) and not isinstance(e, error):
+                raise error(f"couldn't start the browser: {str(e).splitlines()[0][:200]}")
             raise
 
-    def close(self):
-        try:
-            self.browser.close()
-        finally:
-            os.close(self.lock)
+    def expire(self):
+        print(f"{acct_name(self.acct)}: run took over {RUN_TIMEOUT // 60} minutes, stopped", file=sys.stderr, flush=True)
+        kill_leftovers()
+        os._exit(1)
 
-    def authenticate(self):
-        page = self.browser.page
-        # Only a session that is already on Outlook is reloaded; a dead one is left on its sign-in page, so runs never touch auth.
-        if not page.url.startswith(ORIGIN):
-            raise self.error(needs_sign_in(self.acct))
-        for _ in range(2):
-            got = self.grab_headers(page)
-            if got:
-                self.headers = got
-                return
-        raise self.error("Outlook on the web didn't load")
-
-    def grab_headers(self, page, timeout=60):
+    def capture_headers(self, navigate, timeout, stop_on_login):
         got = {}
 
         def grab(req):
@@ -146,24 +140,93 @@ class Calendar:
             if not got and req.url.startswith(ORIGIN + "/owa/service.svc") and h.get("authorization", "").startswith("Bearer"):
                 got.update({k: h[k] for k in SESSION_HEADERS if k in h})
 
-        ctx = self.browser.ctx
-        ctx.on("request", grab)
+        self.ctx.on("request", grab)
         try:
-            page.reload(wait_until="commit")
+            navigate()
             end = time.time() + timeout
             while not got and time.time() < end:
-                page.wait_for_timeout(500)
-                if on_login_page(page.url):
-                    raise self.error(needs_sign_in(self.acct))
-        except self.browser.Error as e:
+                self.page.wait_for_timeout(500)
+                if stop_on_login and on_login_page(self.page.url):
+                    raise self.error("signed out during the run")
+        except self.Error as e:
             raise self.error(f"browser error: {str(e).splitlines()[0][:200]}")
         finally:
-            ctx.remove_listener("request", grab)
+            self.ctx.remove_listener("request", grab)
         return got
 
+    def sign_in(self, timeout=SIGN_IN_TIMEOUT):
+        def navigate():
+            self.page.goto(CALENDAR_URL, wait_until="commit")
+            self.page.bring_to_front()
+            print(f"Sign in to {acct_name(self.acct)} in the browser window that just opened."
+                  f" Waiting up to {timeout // 60} minutes.", flush=True)
+
+        got = self.capture_headers(navigate, timeout, stop_on_login=False)
+        if not got:
+            raise self.error("sign-in timed out")
+        self.signed_in = True
+        return got
+
+    def reload_headers(self):
+        got = self.capture_headers(lambda: self.page.reload(wait_until="commit"), 60, stop_on_login=True)
+        if not got:
+            raise self.error("Outlook on the web didn't load")
+        return got
+
+    def evaluate(self, *args):
+        try:
+            return self.page.evaluate(*args)
+        except self.Error as e:
+            raise self.error(f"browser error: {str(e).splitlines()[0][:200]}")
+
+    def sign_out(self, budget=5):
+        end = time.time() + budget
+        for url in SIGN_OUT_URLS:
+            left = end - time.time()
+            if left <= 0:
+                return
+            try:
+                self.page.goto(url, wait_until="commit", timeout=left * 1000)
+                self.page.wait_for_timeout(min(1000, max(0, (end - time.time()) * 1000)))
+            except Exception:
+                pass
+
+    def close(self):
+        try:
+            for step in (self.sign_out if self.signed_in else None, getattr(self.ctx, "close", None),
+                         getattr(self.browser, "close", None), getattr(self.pw, "stop", None)):
+                if step:
+                    try:
+                        step()
+                    except Exception:
+                        pass
+            self.ctx = self.browser = self.pw = None
+        finally:
+            kill_leftovers()
+            self.watchdog.cancel()
+            os.close(self.lock)
+
+
+def acct_name(acct):
+    return acct["name"] if acct else "Outlook on the web"
+
+
+class Calendar:
+    def __init__(self, cfg, acct, error, tag, creation_time, on_created=None):
+        self.cfg, self.acct, self.error = cfg, acct, error
+        self.tag, self.creation_time = tag, creation_time
+        self.on_created = on_created
+        self.session = Session(error, acct)
+        try:
+            self.headers = self.session.sign_in()
+        except BaseException:
+            self.session.close()
+            raise
+
+    def close(self):
+        self.session.close()
+
     def call(self, method, path, body=None):
-        if self.headers is None:
-            self.authenticate()
         reauthenticated = False
         attempt = 0
         while True:
@@ -174,16 +237,12 @@ class Calendar:
             if body is not None:
                 headers["content-type"] = "application/json; charset=utf-8"
                 data = json.dumps(body)
-            try:
-                status, text = self.browser.page.evaluate(FETCH, [ORIGIN + path, method, headers, data])
-            except self.browser.Error as e:
-                raise self.error(f"browser error: {str(e).splitlines()[0][:200]}")
+            status, text = self.session.evaluate(FETCH, [ORIGIN + path, method, headers, data])
             if status in (401, 403):
                 if reauthenticated:
-                    raise self.error(needs_sign_in(self.acct))
+                    raise self.error("Outlook on the web refused the session")
                 reauthenticated = True
-                self.headers = None
-                self.authenticate()
+                self.headers = self.session.reload_headers()
                 continue
             if status in (429, 500, 502, 503, 504) and attempt < 3:
                 time.sleep(2 ** attempt)
@@ -226,8 +285,8 @@ class Calendar:
             "ResponseRequested": False,
             "SingleValueExtendedProperties": [{"PropertyId": self.tag, "Value": src}],
         })
-        if r and r.get("iCalUId"):
-            self.created.append(r["iCalUId"])
+        if r and r.get("iCalUId") and self.on_created:
+            self.on_created(r["iCalUId"])
 
     def delete_event(self, event_id):
         self.call("DELETE", f"/api/beta/me/events/{urllib.parse.quote(event_id, safe='')}")
@@ -261,93 +320,3 @@ def graph_shape(ev):
         "singleValueExtendedProperties": [{"id": p["PropertyId"], "value": p.get("Value")}
                                           for p in ev.get("SingleValueExtendedProperties") or []],
     }
-
-
-def start_browser(error):
-    domain = f"gui/{os.getuid()}"
-    if subprocess.run(["launchctl", "kickstart", f"{domain}/{BROWSER_JOB}"], capture_output=True).returncode:
-        plist = Path.home() / "Library/LaunchAgents" / f"{BROWSER_JOB}.plist"
-        if not plist.exists():
-            raise error(f"browser not running, and {plist} isn't installed (see README)")
-        subprocess.run(["launchctl", "bootstrap", domain, str(plist)], capture_output=True)
-    end = time.time() + 60
-    while time.time() < end:
-        try:
-            return Browser(error)
-        except error:
-            time.sleep(1)
-    raise error("browser didn't start")
-
-
-def login(acct, error, timeout=600):
-    lock = take_lock(error)
-    try:
-        try:
-            browser = Browser(error)
-        except error:
-            browser = start_browser(error)
-        try:
-            got = []
-
-            def grab(req):
-                if req.url.startswith(ORIGIN + "/owa/service.svc") and req.headers.get("authorization", "").startswith("Bearer"):
-                    got.append(True)
-
-            browser.ctx.on("request", grab)
-            browser.set_window("normal")
-            browser.page.bring_to_front()
-            browser.page.goto(CALENDAR_URL, wait_until="commit")
-            print(f"Sign in to {acct['name']} in the browser window that just opened. Waiting up to {timeout // 60} minutes.",
-                  flush=True)
-            end = time.time() + timeout
-            while not got and time.time() < end:
-                browser.page.wait_for_timeout(1000)
-            if not got:
-                raise error("sign-in timed out; the window stays open, run login again when ready")
-            browser.page.wait_for_timeout(3000)
-            browser.set_window("minimized")
-        except browser.Error as e:
-            raise error(f"browser error: {str(e).splitlines()[0][:200]}")
-        finally:
-            browser.close()
-    finally:
-        os.close(lock)
-
-
-def run_browser():
-    from playwright.sync_api import sync_playwright
-    with sync_playwright() as p:
-        exe = p.chromium.executable_path
-    PROFILE.mkdir(parents=True, exist_ok=True)
-    os.chmod(HOME, 0o700)
-    os.chmod(PROFILE, 0o700)
-    (PROFILE / "DevToolsActivePort").unlink(missing_ok=True)
-    # about:blank instead of Outlook: a fresh start has no session, and only a deliberate login should go to the sign-in page.
-    proc = subprocess.Popen([exe, f"--user-data-dir={PROFILE}", *CHROMIUM_FLAGS, "about:blank"])
-    signal.signal(signal.SIGTERM, lambda *_: proc.terminate())
-    try:
-        end = time.time() + 60
-        while devtools_port() is None and proc.poll() is None and time.time() < end:
-            time.sleep(0.5)
-        try:
-            browser = Browser(RuntimeError)
-            try:
-                browser.set_window("minimized")
-            finally:
-                browser.close()
-        except Exception as e:
-            print(f"couldn't minimize the browser window: {e}", file=sys.stderr, flush=True)
-        return proc.wait()
-    finally:
-        if proc.poll() is None:
-            proc.terminate()
-            try:
-                proc.wait(10)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-
-
-if __name__ == "__main__":
-    if sys.argv[1:] != ["browser"]:
-        sys.exit("usage: owa.py browser")
-    sys.exit(run_browser())

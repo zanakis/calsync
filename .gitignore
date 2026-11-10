@@ -3,6 +3,7 @@ config.json
 config.own.json
 tokens.json
 owa-blocks.json
+owa-state.json
 *.log
 
 # Python
