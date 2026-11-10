@@ -6,6 +6,7 @@ import hashlib
 import http.server
 import json
 import os
+import re
 import secrets
 import sys
 import time
@@ -14,7 +15,8 @@ import urllib.parse
 import urllib.request
 import webbrowser
 from collections import Counter, defaultdict
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.environ.get("CALSYNC_CONFIG", os.path.join(HERE, "config.json"))
@@ -60,7 +62,7 @@ def load_config():
     if len(set(names)) != len(names):
         sys.exit("Account names in config.json must be unique")
     for a in cfg["accounts"]:
-        if not (a.get("client_id") or cfg.get("client_id")):
+        if not (a.get("client_id") or cfg.get("client_id") or a.get("ics_url")):
             sys.exit(f"No client_id set for account {a['name']!r}")
     return cfg
 
@@ -364,6 +366,264 @@ def create_block(cfg, token, src, start, end, show_as, all_day):
     })
 
 
+WINDOWS_ZONES = {
+    "UTC": "UTC", "Coordinated Universal Time": "UTC",
+    "GMT Standard Time": "Europe/London", "Greenwich Standard Time": "Atlantic/Reykjavik",
+    "W. Europe Standard Time": "Europe/Berlin", "Romance Standard Time": "Europe/Paris",
+    "Central Europe Standard Time": "Europe/Budapest", "Central European Standard Time": "Europe/Warsaw",
+    "E. Europe Standard Time": "Europe/Chisinau", "FLE Standard Time": "Europe/Kiev",
+    "GTB Standard Time": "Europe/Bucharest", "Russian Standard Time": "Europe/Moscow",
+    "Eastern Standard Time": "America/New_York", "Central Standard Time": "America/Chicago",
+    "Mountain Standard Time": "America/Denver", "Pacific Standard Time": "America/Los_Angeles",
+    "India Standard Time": "Asia/Kolkata", "China Standard Time": "Asia/Shanghai",
+    "Tokyo Standard Time": "Asia/Tokyo", "AUS Eastern Standard Time": "Australia/Sydney",
+}
+BUSY_STATUS = {"BUSY": "busy", "OOF": "oof", "TENTATIVE": "tentative", "FREE": "free",
+               "WORKINGELSEWHERE": "workingElsewhere"}
+WEEKDAYS = ["MO", "TU", "WE", "TH", "FR", "SA", "SU"]
+GOID_PREFIX = bytes.fromhex("040000008200E00074C5B7101A82E008")
+RRULE_PARTS = {"FREQ", "UNTIL", "COUNT", "INTERVAL", "BYDAY", "BYMONTHDAY", "BYMONTH", "BYSETPOS", "WKST"}
+
+
+def zone(name):
+    try:
+        return ZoneInfo(WINDOWS_ZONES.get(name, name))
+    except (ZoneInfoNotFoundError, ValueError):
+        raise SyncError(f"unknown time zone {name!r}")
+
+
+def is_ics(acct):
+    return bool(acct.get("ics_url"))
+
+
+def source_id(tokens, acct):
+    # Prefixed so it can never collide with a Graph object ID, and sorts after them so a Graph copy of a shared meeting wins ties.
+    if is_ics(acct):
+        return "ics:" + (acct.get("email") or acct["name"]).lower()
+    return account_oid(tokens, acct)
+
+
+def fetch_ics(acct):
+    req = urllib.request.Request(acct["ics_url"], headers={"User-Agent": "calsync"})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            text = r.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as e:
+        raise SyncError(f"ICS feed fetch failed (HTTP {e.code})")
+    except (urllib.error.URLError, OSError) as e:
+        raise SyncError(f"ICS feed fetch failed: {getattr(e, 'reason', e)}")
+    if "BEGIN:VCALENDAR" not in text or "END:VCALENDAR" not in text:
+        raise SyncError("ICS feed didn't return a complete calendar")
+    return text
+
+
+def ics_components(text):
+    events, current, depth = [], None, 0
+    for line in text.replace("\r\n", "\n").replace("\n ", "").replace("\n\t", "").split("\n"):
+        if not line:
+            continue
+        name, _, value = line.partition(":")
+        name, *params = name.split(";")
+        name = name.upper()
+        if name == "BEGIN":
+            if value.upper() == "VEVENT" and current is None:
+                current, depth = defaultdict(list), 0
+            elif current is not None:
+                depth += 1
+        elif name == "END" and current is not None:
+            if depth:
+                depth -= 1
+            elif value.upper() == "VEVENT":
+                events.append(current)
+                current = None
+        elif current is not None and not depth:
+            current[name].append((dict(p.split("=", 1) for p in params if "=" in p), value))
+    return events
+
+
+def ics_first(ev, name, default=None):
+    return ev[name][0] if ev.get(name) else (None, default)
+
+
+def ics_text(value):
+    return re.sub(r"\\(.)", lambda m: "\n" if m.group(1) in "nN" else m.group(1), value or "")
+
+
+def ics_time(params, value, local):
+    """A DATE as a date, else an aware datetime (floating times are taken as local)."""
+    value = value.strip()
+    if params.get("VALUE", "").upper() == "DATE" or len(value) == 8:
+        return datetime.strptime(value[:8], "%Y%m%d").date()
+    dt = datetime.strptime(value[:15], "%Y%m%dT%H%M%S")
+    if value.endswith("Z"):
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.replace(tzinfo=zone(params["TZID"].strip('"')) if "TZID" in params else local)
+
+
+def as_instant(t, local):
+    if isinstance(t, datetime):
+        return t.astimezone(timezone.utc)
+    return datetime(t.year, t.month, t.day, tzinfo=local).astimezone(timezone.utc)
+
+
+def month_days(year, month, byday, bymonthday):
+    first = date(year, month, 1)
+    last = (date(year + month // 12, month % 12 + 1, 1) - timedelta(days=1)).day
+    days = set()
+    for d in bymonthday:
+        d = d if d > 0 else last + 1 + d
+        if 1 <= d <= last:
+            days.add(first.replace(day=d))
+    for n, wd in byday:
+        matches = [first.replace(day=d) for d in range(1, last + 1) if first.replace(day=d).weekday() == wd]
+        if n == 0:
+            days.update(matches)
+        elif -len(matches) <= n <= len(matches) and n:
+            days.add(matches[n - 1 if n > 0 else n])
+    return days
+
+
+def rrule_dates(rule, first, until_date):
+    parts = dict(p.split("=", 1) for p in rule.upper().split(";") if "=" in p)
+    if set(parts) - RRULE_PARTS or parts.get("FREQ") not in ("DAILY", "WEEKLY", "MONTHLY", "YEARLY"):
+        raise SyncError(f"unsupported recurrence rule {rule!r}")
+    freq, interval = parts["FREQ"], int(parts.get("INTERVAL", 1))
+    byday = [(int(d[:-2] or 0), WEEKDAYS.index(d[-2:])) for d in parts.get("BYDAY", "").split(",") if d]
+    bymonthday = [int(d) for d in parts.get("BYMONTHDAY", "").split(",") if d]
+    bymonth = [int(m) for m in parts.get("BYMONTH", "").split(",") if m]
+    setpos = [int(p) for p in parts.get("BYSETPOS", "").split(",") if p]
+    wkst = WEEKDAYS.index(parts.get("WKST", "MO"))
+    period = 0
+    while True:
+        if freq == "DAILY":
+            day = first + timedelta(days=period * interval)
+            if day > until_date:
+                return
+            cands = {day} if (not byday or day.weekday() in {wd for _, wd in byday}) else set()
+        elif freq == "WEEKLY":
+            week = first - timedelta(days=(first.weekday() - wkst) % 7) + timedelta(weeks=period * interval)
+            if week > until_date:
+                return
+            wds = {wd for _, wd in byday} or {first.weekday()}
+            cands = {week + timedelta(days=(wd - wkst) % 7) for wd in wds}
+        elif freq == "MONTHLY":
+            m = first.month - 1 + period * interval
+            year, month = first.year + m // 12, m % 12 + 1
+            if date(year, month, 1) > until_date:
+                return
+            cands = month_days(year, month, byday, bymonthday or ([] if byday else [first.day]))
+        else:
+            year = first.year + period * interval
+            if date(year, 1, 1) > until_date:
+                return
+            cands = set()
+            for month in bymonth or [first.month]:
+                cands |= month_days(year, month, byday, bymonthday or ([] if byday else [first.day]))
+        if bymonth:
+            cands = {d for d in cands if d.month in bymonth}
+        cands = sorted(cands)
+        if setpos:
+            cands = sorted({cands[p - 1 if p > 0 else p] for p in setpos if -len(cands) <= p <= len(cands) and p})
+        for day in cands:
+            if first <= day <= until_date:
+                yield day
+        period += 1
+        if period > 100000:
+            raise SyncError(f"recurrence rule {rule!r} doesn't end")
+
+
+def ics_occurrences(ev, local, horizon):
+    start = ics_time(*ics_first(ev, "DTSTART"), local)
+    if ev.get("DTEND"):
+        end = ics_time(*ev["DTEND"][0], local)
+    else:
+        end = start + timedelta(days=1) if not isinstance(start, datetime) else start
+    if type(start) is not type(end):
+        raise SyncError("ICS event mixes a date and a time in DTSTART/DTEND")
+    if not ev.get("RRULE"):
+        return [(start, end)]
+    rule = ev["RRULE"][0][1]
+    parts = dict(p.split("=", 1) for p in rule.upper().split(";") if "=" in p)
+    count = int(parts["COUNT"]) if "COUNT" in parts else None
+    stop = horizon
+    if "UNTIL" in parts:
+        stop = min(stop, as_instant(ics_time({}, parts["UNTIL"], start.tzinfo if isinstance(start, datetime) else local), local))
+    excluded = {as_instant(ics_time(p, v, local), local)
+                for p, values in ev.get("EXDATE", []) for v in values.split(",")}
+    timed = isinstance(start, datetime)
+    first = start.date() if timed else start
+    length = end - start
+    out = []
+    for n, day in enumerate(rrule_dates(rule, first, stop.astimezone(start.tzinfo if timed else local).date() + timedelta(days=1))):
+        if count is not None and n >= count:
+            break
+        occ = datetime.combine(day, start.timetz()) if timed else day
+        instant = as_instant(occ, local)
+        if instant > stop:
+            break
+        if instant not in excluded:
+            out.append((occ, occ + length))
+    return out
+
+
+def graph_uid(uid, original):
+    """The iCalUId Graph shows for this UID: Outlook's global object ID, dated for an occurrence of a series."""
+    try:
+        goid = bytearray.fromhex(uid)
+    except ValueError:
+        goid = None
+    if not goid or not goid.startswith(GOID_PREFIX) or len(goid) < 40:
+        raw = uid.encode() + b"\0"
+        goid = bytearray(GOID_PREFIX + bytes(20) + (len(raw) + 12).to_bytes(4, "little") + b"vCal-Uid" + (1).to_bytes(4, "little") + raw)
+    if original is not None:
+        goid[16:20] = original.year.to_bytes(2, "big") + bytes([original.month, original.day])
+    return goid.hex().upper()
+
+
+def ics_events(cfg, acct, start, end):
+    text = fetch_ics(acct)
+    try:
+        return parse_ics(cfg, text, start, end)
+    except (ValueError, KeyError, IndexError, TypeError) as e:
+        raise SyncError(f"couldn't read the ICS feed ({type(e).__name__}: {e})")
+
+
+def parse_ics(cfg, text, start, end):
+    local = zone(cfg["timezone"])
+    components = [ev for ev in ics_components(text) if ev.get("DTSTART")]
+    overridden = {(ics_text(ics_first(ev, "UID")[1]), as_instant(ics_time(*ev["RECURRENCE-ID"][0], local), local))
+                  for ev in components if ev.get("RECURRENCE-ID")}
+    events = []
+    for ev in components:
+        uid = ics_text(ics_first(ev, "UID")[1])
+        busy = ics_first(ev, "X-MICROSOFT-CDO-BUSYSTATUS")[1]
+        transparent = ics_first(ev, "TRANSP", "OPAQUE")[1].upper() == "TRANSPARENT"
+        show_as = BUSY_STATUS.get((busy or "").upper(), "free" if transparent else "busy")
+        for s, e in ics_occurrences(ev, local, end):
+            if not ev.get("RECURRENCE-ID") and ev.get("RRULE") and (uid, as_instant(s, local)) in overridden:
+                continue
+            s_utc, e_utc = as_instant(s, local), as_instant(e, local)
+            if not (s_utc < end and (e_utc > start or s_utc >= start)):
+                continue
+            all_day = not isinstance(s, datetime)
+            if ev.get("RECURRENCE-ID"):
+                original = ics_time(*ev["RECURRENCE-ID"][0], local)
+            else:
+                original = s if ev.get("RRULE") else None
+            fmt = (lambda t: f"{t:%Y-%m-%d}T00:00:00.0000000") if all_day else \
+                (lambda t: f"{t.astimezone(local):%Y-%m-%dT%H:%M:%S}.0000000")
+            events.append({
+                "start": {"dateTime": fmt(s)},
+                "end": {"dateTime": fmt(e)},
+                "showAs": show_as,
+                "isAllDay": all_day,
+                "isCancelled": ics_first(ev, "STATUS", "")[1].upper() == "CANCELLED",
+                "subject": ics_text(ics_first(ev, "SUMMARY", "")[1]),
+                "iCalUId": graph_uid(uid, original),
+            })
+    return events
+
+
 def cmd_sync(cfg, tokens, args):
     today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
     start, end = today - timedelta(days=1), today + timedelta(days=cfg.get("days_ahead", 60))
@@ -372,9 +632,12 @@ def cmd_sync(cfg, tokens, args):
     fetched, ok = {}, True
     for acct in cfg["accounts"]:
         try:
+            if is_ics(acct):
+                fetched[source_id(tokens, acct)] = (acct["name"], None, ics_events(cfg, acct, start, end), False)
+                continue
             token = access_token(cfg, acct, tokens)
             events = list_events(cfg, token, start, end)
-            fetched[account_oid(tokens, acct)] = (acct["name"], token, events, acct.get("receive_blocks", True))
+            fetched[source_id(tokens, acct)] = (acct["name"], token, events, acct.get("receive_blocks", True))
         except SyncError as e:
             ok = False
             log(f"{acct['name']}: {e}")
@@ -385,6 +648,8 @@ def cmd_sync(cfg, tokens, args):
     })
 
     for target, (name, token, events, receives) in fetched.items():
+        if token is None:
+            continue
         wanted = Counter()
         if receives:
             wanted.update(key for holders, key in meetings if target not in holders)
@@ -430,6 +695,8 @@ def wants_device(cfg, acct):
 
 def cmd_login(cfg, tokens, args):
     acct = account(cfg, args.name)
+    if is_ics(acct):
+        sys.exit(f"{acct['name']} is read from its ICS feed and needs no sign-in")
     use_device = args.device or (not args.paste and wants_device(cfg, acct))
     t = login_device(cfg, acct) if use_device else login_browser(cfg, acct, args.paste)
     if "access_token" not in t:
@@ -445,6 +712,11 @@ def cmd_status(cfg, tokens, args):
     rc = 0
     for acct in cfg["accounts"]:
         try:
+            if is_ics(acct):
+                today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+                events = ics_events(cfg, acct, today - timedelta(days=1), today + timedelta(days=cfg.get("days_ahead", 60)))
+                print(f"{acct['name']}: ICS feed OK, {len(events)} events in the sync window (read-only)")
+                continue
             token = access_token(cfg, acct, tokens)
             graph(cfg, token, "GET", "/me/calendar?$select=name")
             print(f"{acct['name']}: OK ({tokens[acct['name']]['user']})")
@@ -458,6 +730,9 @@ def cmd_clean(cfg, tokens, args):
     rc = 0
     for name in args.names or [a["name"] for a in cfg["accounts"]]:
         acct = account(cfg, name)
+        if is_ics(acct):
+            print(f"{name}: ICS feed, nothing to clean in it")
+            continue
         try:
             token = access_token(cfg, acct, tokens)
             ids = [event_id for event_id, _ in tagged_blocks(cfg, token)]
@@ -474,11 +749,13 @@ def cmd_clean(cfg, tokens, args):
 def cmd_remove(cfg, tokens, args):
     acct = account(cfg, args.name)
     try:
-        oid = account_oid(tokens, acct)
+        oid = source_id(tokens, acct)
     except SyncError as e:
         sys.exit(f"{acct['name']}: {e}")
     blocked = False
     for other in cfg["accounts"]:
+        if is_ics(other):
+            continue
         try:
             token = access_token(cfg, other, tokens)
             ids = [event_id for event_id, src in tagged_blocks(cfg, token) if other is acct or src == oid]
@@ -490,6 +767,9 @@ def cmd_remove(cfg, tokens, args):
             blocked = blocked or other is not acct
     if blocked:
         sys.exit("Some calendars couldn't be cleaned up. Fix that and run remove again.")
+    if is_ics(acct):
+        print(f"Removed {acct['name']}'s blocks. Now delete it from config.json.")
+        return
     del tokens[acct["name"]]
     save_tokens(tokens)
     print(f"Signed out of {acct['name']}. Now delete it from config.json.")
