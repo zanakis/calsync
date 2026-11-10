@@ -2,11 +2,13 @@
 config.json
 config.own.json
 tokens.json
+owa-blocks.json
 *.log
 
 # Python
 __pycache__/
 *.pyc
+.venv/
 
 # Android / Gradle build output
 android/build/

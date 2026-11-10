@@ -2,8 +2,10 @@
 """Mirror busy time between Microsoft 365 calendars as private "Busy" blocks."""
 import argparse
 import base64
+import contextlib
 import hashlib
 import http.server
+import importlib.util
 import json
 import os
 import re
@@ -21,6 +23,9 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.environ.get("CALSYNC_CONFIG", os.path.join(HERE, "config.json"))
 TOKENS_PATH = os.environ.get("CALSYNC_TOKENS", os.path.join(HERE, "tokens.json"))
+OWA_BLOCKS_PATH = os.environ.get("CALSYNC_OWA_BLOCKS", os.path.join(HERE, "owa-blocks.json"))
+VENV_PYTHON = os.path.join(HERE, ".venv", "bin", "python")
+OWA_BLOCK_RETENTION = 3 * 86400
 GRAPH = "https://graph.microsoft.com/v1.0"
 SCOPES = "https://graph.microsoft.com/Calendars.ReadWrite offline_access openid profile"
 TAG = "String {6f1c2a52-8e4b-4d8e-9a57-3c0f5b7d2e91} Name CalSyncSource"
@@ -47,12 +52,16 @@ def load_json(path, default=None):
         return default
 
 
-def save_tokens(tokens):
-    tmp = f"{TOKENS_PATH}.{os.getpid()}.tmp"
+def save_json(path, data):
+    tmp = f"{path}.{os.getpid()}.tmp"
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as f:
-        json.dump(tokens, f, indent=2)
-    os.replace(tmp, TOKENS_PATH)
+        json.dump(data, f, indent=2)
+    os.replace(tmp, path)
+
+
+def save_tokens(tokens):
+    save_json(TOKENS_PATH, tokens)
 
 
 def load_config():
@@ -64,6 +73,10 @@ def load_config():
     for a in cfg["accounts"]:
         if not (a.get("client_id") or cfg.get("client_id") or a.get("ics_url")):
             sys.exit(f"No client_id set for account {a['name']!r}")
+        if a.get("owa") and not a.get("ics_url"):
+            sys.exit(f"Account {a['name']!r} uses Outlook on the web, which also needs its ics_url")
+    if sum(1 for a in cfg["accounts"] if a.get("owa")) > 1:
+        sys.exit("Only one account can use Outlook on the web, since they share one browser")
     return cfg
 
 
@@ -311,9 +324,9 @@ def tag_of(ev):
     return None
 
 
-def tagged_blocks(cfg, token):
+def tagged_blocks(cal):
     now = datetime.now(timezone.utc)
-    events = list_events(cfg, token, now - timedelta(days=360), now + timedelta(days=360))
+    events = cal.list_events(now - timedelta(days=360), now + timedelta(days=360))
     return [(ev["id"], tag_of(ev)) for ev in events if tag_of(ev) is not None]
 
 
@@ -364,6 +377,58 @@ def create_block(cfg, token, src, start, end, show_as, all_day):
         "responseRequested": False,
         "singleValueExtendedProperties": [{"id": TAG, "value": src}],
     })
+
+
+class GraphCalendar:
+    def __init__(self, cfg, acct, tokens):
+        self.cfg, self.token = cfg, access_token(cfg, acct, tokens)
+
+    def list_events(self, start, end):
+        return list_events(self.cfg, self.token, start, end)
+
+    def create_block(self, *key):
+        create_block(self.cfg, self.token, *key)
+
+    def delete_event(self, event_id):
+        delete_event(self.cfg, self.token, event_id)
+
+
+def is_owa(acct):
+    return bool(acct.get("owa"))
+
+
+def owa_module():
+    try:
+        import owa
+    except ImportError:
+        raise SyncError("Outlook on the web needs calsync's .venv (see README)")
+    return owa
+
+
+def open_calendar(cfg, acct, tokens, stack):
+    """The writable calendar behind an account, or None for one that is only read from its ICS feed."""
+    if is_owa(acct):
+        cal = owa_module().Calendar(cfg, acct, SyncError, TAG, CREATION_TIME)
+        stack.callback(cal.close)
+        return cal
+    if is_ics(acct):
+        return None
+    return GraphCalendar(cfg, acct, tokens)
+
+
+def owa_block_uids(acct):
+    """Meeting IDs of the blocks calsync wrote into an Outlook on the web calendar, as its ICS feed shows them."""
+    return {uid for uid in load_json(OWA_BLOCKS_PATH, {}).get(acct["name"], {})}
+
+
+def record_owa_blocks(acct, uids):
+    # Deleted blocks are kept for a while, because the published feed lags behind the calendar.
+    known = load_json(OWA_BLOCKS_PATH, {})
+    now = time.time()
+    entry = {uid: seen for uid, seen in known.get(acct["name"], {}).items() if seen > now - OWA_BLOCK_RETENTION}
+    entry.update({uid.upper(): now for uid in uids if uid})
+    known[acct["name"]] = entry
+    save_json(OWA_BLOCKS_PATH, known)
 
 
 WINDOWS_ZONES = {
@@ -624,20 +689,35 @@ def parse_ics(cfg, text, start, end):
     return events
 
 
-def cmd_sync(cfg, tokens, args):
+def sync_window(cfg):
     today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
-    start, end = today - timedelta(days=1), today + timedelta(days=cfg.get("days_ahead", 60))
+    return today - timedelta(days=1), today + timedelta(days=cfg.get("days_ahead", 60))
+
+
+def read_ics(cfg, acct, start, end):
+    events = ics_events(cfg, acct, start, end)
+    if is_owa(acct):
+        # The feed shows calsync's own blocks as plain busy time; mirroring them would echo every block back out.
+        blocks = owa_block_uids(acct)
+        events = [ev for ev in events if ev["iCalUId"].upper() not in blocks]
+    return events
+
+
+def cmd_sync(cfg, tokens, args):
+    start, end = sync_window(cfg)
     mirror = set(cfg.get("mirror_show_as", DEFAULT_SHOW_AS))
 
     fetched, ok = {}, True
     for acct in cfg["accounts"]:
         try:
-            if is_ics(acct):
-                fetched[source_id(tokens, acct)] = (acct["name"], None, ics_events(cfg, acct, start, end), False)
+            writes = is_owa(acct) == bool(args.owa)
+            if is_ics(acct) and not (writes and is_owa(acct)):
+                fetched[source_id(tokens, acct)] = (acct["name"], None, read_ics(cfg, acct, start, end), False)
                 continue
-            token = access_token(cfg, acct, tokens)
-            events = list_events(cfg, token, start, end)
-            fetched[source_id(tokens, acct)] = (acct["name"], token, events, acct.get("receive_blocks", True))
+            cal = open_calendar(cfg, acct, tokens, args.stack)
+            events = cal.list_events(start, end)
+            fetched[source_id(tokens, acct)] = (acct["name"], cal if writes else None, events,
+                                                acct.get("receive_blocks", True))
         except SyncError as e:
             ok = False
             log(f"{acct['name']}: {e}")
@@ -647,8 +727,8 @@ def cmd_sync(cfg, tokens, args):
         for oid, (_, _, events, _) in fetched.items()
     })
 
-    for target, (name, token, events, receives) in fetched.items():
-        if token is None:
+    for target, (name, cal, events, receives) in fetched.items():
+        if cal is None:
             continue
         wanted = Counter()
         if receives:
@@ -672,18 +752,23 @@ def cmd_sync(cfg, tokens, args):
         if args.dry_run:
             continue
 
-        for _, event_id in stale:
-            try:
-                delete_event(cfg, token, event_id)
-            except SyncError as e:
-                ok = False
-                log(f"{name}: {e}")
-        for key in missing:
-            try:
-                create_block(cfg, token, *key)
-            except SyncError as e:
-                ok = False
-                log(f"{name}: {e}")
+        try:
+            for _, event_id in stale:
+                try:
+                    cal.delete_event(event_id)
+                except SyncError as e:
+                    ok = False
+                    log(f"{name}: {e}")
+            for key in missing:
+                try:
+                    cal.create_block(*key)
+                except SyncError as e:
+                    ok = False
+                    log(f"{name}: {e}")
+        finally:
+            acct = account(cfg, name)
+            if is_owa(acct):
+                record_owa_blocks(acct, [ev["iCalUId"] for ev in events if tag_of(ev) is not None] + cal.created)
     return 0 if ok else 1
 
 
@@ -695,6 +780,13 @@ def wants_device(cfg, acct):
 
 def cmd_login(cfg, tokens, args):
     acct = account(cfg, args.name)
+    if is_owa(acct):
+        try:
+            owa_module().login(acct, SyncError)
+        except SyncError as e:
+            sys.exit(f"{acct['name']}: {e}")
+        print(f"Signed in to {acct['name']} in Outlook on the web")
+        return
     if is_ics(acct):
         sys.exit(f"{acct['name']} is read from its ICS feed and needs no sign-in")
     use_device = args.device or (not args.paste and wants_device(cfg, acct))
@@ -710,16 +802,22 @@ def cmd_login(cfg, tokens, args):
 
 def cmd_status(cfg, tokens, args):
     rc = 0
+    start, end = sync_window(cfg)
     for acct in cfg["accounts"]:
         try:
             if is_ics(acct):
-                today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
-                events = ics_events(cfg, acct, today - timedelta(days=1), today + timedelta(days=cfg.get("days_ahead", 60)))
-                print(f"{acct['name']}: ICS feed OK, {len(events)} events in the sync window (read-only)")
-                continue
-            token = access_token(cfg, acct, tokens)
-            graph(cfg, token, "GET", "/me/calendar?$select=name")
-            print(f"{acct['name']}: OK ({tokens[acct['name']]['user']})")
+                events = ics_events(cfg, acct, start, end)
+                own = len(events) - len(read_ics(cfg, acct, start, end)) if is_owa(acct) else 0
+                print(f"{acct['name']}: ICS feed OK, {len(events) - own} events in the sync window"
+                      + (f" plus {own} of calsync's blocks" if is_owa(acct) else " (read-only)"))
+            if is_owa(acct):
+                cal = open_calendar(cfg, acct, tokens, args.stack)
+                blocks = [ev for ev in cal.list_events(start, end) if tag_of(ev) is not None]
+                print(f"{acct['name']}: Outlook on the web OK, {len(blocks)} blocks in the sync window")
+            elif not is_ics(acct):
+                cal = open_calendar(cfg, acct, tokens, args.stack)
+                graph(cfg, cal.token, "GET", "/me/calendar?$select=name")
+                print(f"{acct['name']}: OK ({tokens[acct['name']]['user']})")
         except SyncError as e:
             rc = 1
             print(f"{acct['name']}: {e}")
@@ -730,16 +828,16 @@ def cmd_clean(cfg, tokens, args):
     rc = 0
     for name in args.names or [a["name"] for a in cfg["accounts"]]:
         acct = account(cfg, name)
-        if is_ics(acct):
-            print(f"{name}: ICS feed, nothing to clean in it")
-            continue
         try:
-            token = access_token(cfg, acct, tokens)
-            ids = [event_id for event_id, _ in tagged_blocks(cfg, token)]
+            cal = open_calendar(cfg, acct, tokens, args.stack)
+            if cal is None:
+                print(f"{name}: ICS feed, nothing to clean in it")
+                continue
+            ids = [event_id for event_id, _ in tagged_blocks(cal)]
             print(f"{name}: {'would delete' if args.dry_run else 'deleting'} {len(ids)} blocks")
             if not args.dry_run:
                 for event_id in ids:
-                    delete_event(cfg, token, event_id)
+                    cal.delete_event(event_id)
         except SyncError as e:
             rc = 1
             print(f"{name}: {e}")
@@ -754,14 +852,14 @@ def cmd_remove(cfg, tokens, args):
         sys.exit(f"{acct['name']}: {e}")
     blocked = False
     for other in cfg["accounts"]:
-        if is_ics(other):
-            continue
         try:
-            token = access_token(cfg, other, tokens)
-            ids = [event_id for event_id, src in tagged_blocks(cfg, token) if other is acct or src == oid]
+            cal = open_calendar(cfg, other, tokens, args.stack)
+            if cal is None:
+                continue
+            ids = [event_id for event_id, src in tagged_blocks(cal) if other is acct or src == oid]
             print(f"{other['name']}: deleting {len(ids)} blocks")
             for event_id in ids:
-                delete_event(cfg, token, event_id)
+                cal.delete_event(event_id)
         except SyncError as e:
             print(f"{other['name']}: {e}")
             blocked = blocked or other is not acct
@@ -775,6 +873,22 @@ def cmd_remove(cfg, tokens, args):
     print(f"Signed out of {acct['name']}. Now delete it from config.json.")
 
 
+def uses_owa(cfg, args):
+    if args.cmd == "sync":
+        return args.owa
+    if args.cmd == "login":
+        return is_owa(account(cfg, args.name))
+    if args.cmd == "clean" and args.names:
+        return any(is_owa(account(cfg, n)) for n in args.names)
+    return args.cmd in ("status", "remove", "clean") and any(is_owa(a) for a in cfg["accounts"])
+
+
+def use_venv_if_needed(cfg, args):
+    if uses_owa(cfg, args) and importlib.util.find_spec("playwright") is None and os.path.exists(VENV_PYTHON) \
+            and os.path.realpath(sys.prefix) != os.path.realpath(os.path.join(HERE, ".venv")):
+        os.execv(VENV_PYTHON, [VENV_PYTHON, os.path.abspath(__file__)] + sys.argv[1:])
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="cmd")
@@ -785,6 +899,7 @@ def main():
     mode.add_argument("--device", action="store_true", help="sign in with a code at microsoft.com/devicelogin")
     p = sub.add_parser("sync", help="mirror busy blocks between all accounts (default)")
     p.add_argument("--dry-run", action="store_true", help="show changes without making them")
+    p.add_argument("--owa", action="store_true", help="write blocks into the Outlook on the web calendar instead")
     p.add_argument("-v", "--verbose", action="store_true")
     sub.add_parser("status", help="check that every account is signed in")
     p = sub.add_parser("remove", help="delete an account's blocks from every calendar and sign out of it")
@@ -795,10 +910,13 @@ def main():
 
     args = parser.parse_args(sys.argv[1:] or ["sync"])
     cfg = load_config()
+    use_venv_if_needed(cfg, args)
     tokens = load_json(TOKENS_PATH, {})
     handler = {"login": cmd_login, "sync": cmd_sync, "status": cmd_status,
                "remove": cmd_remove, "clean": cmd_clean}[args.cmd]
-    sys.exit(handler(cfg, tokens, args) or 0)
+    with contextlib.ExitStack() as args.stack:
+        rc = handler(cfg, tokens, args)
+    sys.exit(rc or 0)
 
 
 if __name__ == "__main__":
