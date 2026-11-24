@@ -1,0 +1,29 @@
+# Main screen and the Add account dialog, from a fresh state with no accounts.
+# Stops before Sign in, so nothing reaches Microsoft.
+#   uiwalk run smoke --var APP=android/app/build/outputs/apk/debug/app-debug.apk
+# Build with `./gradlew assembleDebug` in android/. Without a config.json the
+# build uses config.example.json, which is enough here.
+
+install ${APP}
+sh adb -s ${device} shell pm clear ${app}
+# On a freshly restored emulator the install and clear broadcasts are still
+# being handled after launch, and they relaunch the activity (asset paths
+# change), which closes any open dialog. Let them finish first.
+sh adb -s ${device} shell am wait-for-broadcast-idle
+launch
+
+expect "Calendar Sync"
+expect "Sync now"
+expect "Add at least two accounts to start syncing."
+expect-not ~"Set client_id"
+see-not "A crash report or an error message is showing"
+
+tap @add
+expect @email
+expect "Sign in"
+type @email "smoke@example.com"
+expect "smoke@example.com"
+see "A dialog titled Add account with an email field is showing"
+tap "Cancel"
+expect-not @email
+expect @add
